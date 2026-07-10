@@ -1,0 +1,441 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from typing import Optional
+import sqlite3
+import datetime
+import os
+from dotenv import load_dotenv
+from passlib.context import CryptContext
+from cryptography.fernet import Fernet
+from jose import jwt, JWTError
+
+load_dotenv()
+
+APP_NAME = "Genomed Assist Pro"
+VERSION = "2.1"
+DATABASE_FILE = "genomed.db"
+ALGORITHM = "HS256"
+
+SECRET_KEY = os.getenv(
+    "GENOMED_SECRET_KEY",
+    "local-dev-key-change-in-production"
+)
+
+ENCRYPTION_KEY = os.getenv("GENOMED_ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    ENCRYPTION_KEY = Fernet.generate_key().decode()
+    print("WARNING: No GENOMED_ENCRYPTION_KEY set.")
+    print("Auto-generated key for this session only.")
+    print("Data will not survive a restart.")
+    print("Generate a permanent key with:")
+    print("python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"")
+    print("Then add GENOMED_ENCRYPTION_KEY=<key> to .env file.")
+
+fernet = Fernet(ENCRYPTION_KEY.encode())
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+DISCLAIMER = (
+    "Genomed Assist Pro is a prototype system. "
+    "It does not replace professional medical advice."
+)
+
+app = FastAPI(title=APP_NAME, version=VERSION)
+security = HTTPBearer()
+
+
+def get_db():
+    conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def initialize_database():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS doctors ("
+        "username TEXT PRIMARY KEY,"
+        "password TEXT NOT NULL,"
+        "name TEXT NOT NULL,"
+        "specialization TEXT NOT NULL,"
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS patients ("
+        "id TEXT PRIMARY KEY,"
+        "name TEXT NOT NULL,"
+        "age INTEGER NOT NULL,"
+        "gender TEXT,"
+        "phone TEXT,"
+        "medical_data_encrypted TEXT,"
+        "doctor_id TEXT,"
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP,"
+        "FOREIGN KEY (doctor_id) REFERENCES doctors(username))"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS appointments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "patient_id TEXT NOT NULL,"
+        "doctor_id TEXT NOT NULL,"
+        "date TEXT NOT NULL,"
+        "time TEXT NOT NULL,"
+        "notes TEXT,"
+        "status TEXT DEFAULT 'scheduled',"
+        "FOREIGN KEY(patient_id) REFERENCES patients(id),"
+        "FOREIGN KEY(doctor_id) REFERENCES doctors(username))"
+    )
+    conn.commit()
+    conn.close()
+
+
+initialize_database()
+
+
+def hash_password(password):
+    return pwd_context.hash(password)
+
+
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+
+def encrypt_data(text):
+    if text is None:
+        return None
+    return fernet.encrypt(text.encode()).decode()
+
+
+def decrypt_data(text):
+    if text is None:
+        return None
+    return fernet.decrypt(text.encode()).decode()
+
+
+def decrypt_patient(row):
+    record = dict(row)
+    enc = record.pop("medical_data_encrypted", None)
+    record["diagnosis"] = decrypt_data(enc)
+    return record
+
+
+def create_token(username):
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    payload = {"sub": username, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            SECRET_KEY,
+            algorithms=[ALGORITHM]
+        )
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token expired")
+
+
+class DoctorRegister(BaseModel):
+    username: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=6)
+    name: str
+    specialization: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PatientCreate(BaseModel):
+    id: str
+    name: str
+    age: int = Field(..., gt=0, lt=150)
+    gender: Optional[str] = None
+    phone: Optional[str] = None
+    diagnosis: Optional[str] = None
+
+
+class AppointmentCreate(BaseModel):
+    patient_id: str
+    date: str
+    time: str
+    notes: Optional[str] = None
+
+
+class AppointmentUpdate(BaseModel):
+    status: str
+
+
+@app.get("/", tags=["General"])
+def home():
+    return {
+        "application": APP_NAME,
+        "version": VERSION,
+        "status": "Running",
+        "disclaimer": DISCLAIMER
+    }
+
+
+@app.get("/health", tags=["General"])
+def health():
+    return {"status": "healthy", "app": APP_NAME, "version": VERSION}
+
+
+@app.post("/doctor/register", tags=["Doctors"], status_code=201)
+def register_doctor(doctor: DoctorRegister):
+    conn = get_db()
+    c = conn.cursor()
+    existing = c.execute(
+        "SELECT username FROM doctors WHERE username=?",
+        (doctor.username,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Username already exists")
+    c.execute(
+        "INSERT INTO doctors (username, password, name, specialization)"
+        " VALUES (?,?,?,?)",
+        (doctor.username, hash_password(doctor.password),
+         doctor.name, doctor.specialization)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Doctor registered", "doctor": doctor.name}
+
+
+@app.post("/doctor/login", tags=["Doctors"])
+def login_doctor(data: LoginRequest):
+    conn = get_db()
+    doctor = conn.execute(
+        "SELECT * FROM doctors WHERE username=?",
+        (data.username,)
+    ).fetchone()
+    conn.close()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    if not verify_password(data.password, doctor["password"]):
+        raise HTTPException(status_code=401, detail="Incorrect password")
+    token = create_token(data.username)
+    return {
+        "message": "Welcome " + doctor["name"],
+        "access_token": token,
+        "token_type": "bearer"
+    }
+
+
+@app.get("/doctor/profile", tags=["Doctors"])
+def doctor_profile(username: str = Depends(get_current_user)):
+    conn = get_db()
+    doctor = conn.execute(
+        "SELECT username, name, specialization, created_at"
+        " FROM doctors WHERE username=?",
+        (username,)
+    ).fetchone()
+    conn.close()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return dict(doctor)
+
+
+@app.get("/doctor/my-patients", tags=["Doctors"])
+def doctor_patients(username: str = Depends(get_current_user)):
+    conn = get_db()
+    patients = conn.execute(
+        "SELECT * FROM patients WHERE doctor_id=?",
+        (username,)
+    ).fetchall()
+    conn.close()
+    return {
+        "total": len(patients),
+        "patients": [decrypt_patient(p) for p in patients]
+    }
+
+
+@app.post("/patient/add", tags=["Patients"], status_code=201)
+def add_patient(
+    patient: PatientCreate,
+    username: str = Depends(get_current_user)
+):
+    conn = get_db()
+    c = conn.cursor()
+    existing = c.execute(
+        "SELECT id FROM patients WHERE id=?",
+        (patient.id,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Patient ID exists")
+    enc_diag = encrypt_data(patient.diagnosis)
+    c.execute(
+        "INSERT INTO patients"
+        " (id, name, age, gender, phone, medical_data_encrypted, doctor_id)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (patient.id, patient.name, patient.age,
+         patient.gender, patient.phone, enc_diag, username)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Patient added", "patient_id": patient.id}
+
+
+@app.get("/patients", tags=["Patients"])
+def list_patients(username: str = Depends(get_current_user)):
+    conn = get_db()
+    patients = conn.execute(
+        "SELECT * FROM patients WHERE doctor_id=?",
+        (username,)
+    ).fetchall()
+    conn.close()
+    return {
+        "total": len(patients),
+        "patients": [decrypt_patient(p) for p in patients]
+    }
+
+
+@app.get("/patient/{patient_id}", tags=["Patients"])
+def get_patient(
+    patient_id: str,
+    username: str = Depends(get_current_user)
+):
+    conn = get_db()
+    patient = conn.execute(
+        "SELECT * FROM patients WHERE id=? AND doctor_id=?",
+        (patient_id, username)
+    ).fetchone()
+    conn.close()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return decrypt_patient(patient)
+
+
+@app.delete("/patient/{patient_id}", tags=["Patients"])
+def delete_patient(
+    patient_id: str,
+    username: str = Depends(get_current_user)
+):
+    conn = get_db()
+    result = conn.execute(
+        "DELETE FROM patients WHERE id=? AND doctor_id=?",
+        (patient_id, username)
+    )
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return {"message": "Patient deleted"}
+
+
+@app.post("/appointment/book", tags=["Appointments"], status_code=201)
+def book_appointment(
+    appointment: AppointmentCreate,
+    username: str = Depends(get_current_user)
+):
+    conn = get_db()
+    patient = conn.execute(
+        "SELECT id FROM patients WHERE id=? AND doctor_id=?",
+        (appointment.patient_id, username)
+    ).fetchone()
+    if not patient:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Patient not found")
+    conn.execute(
+        "INSERT INTO appointments"
+        " (patient_id, doctor_id, date, time, notes)"
+        " VALUES (?,?,?,?,?)",
+        (appointment.patient_id, username,
+         appointment.date, appointment.time, appointment.notes)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Appointment booked"}
+
+
+@app.get("/appointments", tags=["Appointments"])
+def list_appointments(username: str = Depends(get_current_user)):
+    conn = get_db()
+    items = conn.execute(
+        "SELECT * FROM appointments WHERE doctor_id=? ORDER BY date, time",
+        (username,)
+    ).fetchall()
+    conn.close()
+    return {"total": len(items), "appointments": [dict(i) for i in items]}
+
+
+@app.put("/appointment/{appointment_id}", tags=["Appointments"])
+def update_appointment(
+    appointment_id: int,
+    update: AppointmentUpdate,
+    username: str = Depends(get_current_user)
+):
+    allowed = {"scheduled", "completed", "cancelled"}
+    if update.status not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    conn = get_db()
+    result = conn.execute(
+        "UPDATE appointments SET status=? WHERE id=? AND doctor_id=?",
+        (update.status, appointment_id, username)
+    )
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    return {"message": "Appointment updated", "status": update.status}
+
+
+TUTORIAL = [
+    {"step": 1, "title": "Welcome", "desc": "Manage patients and appointments."},
+    {"step": 2, "title": "Register", "desc": "Create your doctor account."},
+    {"step": 3, "title": "Login", "desc": "Get your auth token."},
+    {"step": 4, "title": "Add Patients", "desc": "Add patient records."},
+    {"step": 5, "title": "Appointments", "desc": "Book and manage appointments."},
+    {"step": 6, "title": "Profile", "desc": "View your profile and patients."}
+]
+
+FAQ = [
+    {"q": "How to register?", "a": "POST to /doctor/register"},
+    {"q": "How to login?", "a": "POST to /doctor/login"},
+    {"q": "How to add patient?", "a": "POST to /patient/add"},
+    {"q": "How to book appointment?", "a": "POST to /appointment/book"},
+    {"q": "Update appointment?", "a": "PUT to /appointment/{id}"}
+]
+
+
+@app.get("/tutorial", tags=["Help"])
+def get_tutorial():
+    return {"message": "Welcome to " + APP_NAME, "tutorial": TUTORIAL}
+
+
+@app.get("/tutorial/again", tags=["Help"])
+def tutorial_again():
+    return {"message": "Showing tutorial again", "tutorial": TUTORIAL}
+
+
+@app.get("/help", tags=["Help"])
+def help_center():
+    return {
+        "application": APP_NAME,
+        "features": [
+            "Doctor Management",
+            "Patient Management",
+            "Appointment Management",
+            "Tutorial System"
+        ]
+    }
+
+
+@app.get("/faq", tags=["Help"])
+def faq():
+    return {"faq": FAQ}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
