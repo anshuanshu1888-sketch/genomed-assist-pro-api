@@ -1,0 +1,566 @@
+"""
+test_main.py — pytest suite for Genomed Assist Pro
+
+Matches the real application exactly:
+    GET    /health
+    POST   /doctor/register
+    POST   /doctor/login
+    GET    /doctor/profile
+    GET    /doctor/my-patients
+    POST   /patient/add
+    GET    /patients
+    GET    /patient/{patient_id}
+    DELETE /patient/{patient_id}
+    POST   /appointment/book
+    GET    /appointments
+    PUT    /appointment/{appointment_id}
+    GET    /tutorial
+    GET    /tutorial/again
+    GET    /help
+    GET    /faq
+
+DATABASE ISOLATION
+-------------------
+`main.py` hardcodes `DATABASE_FILE = "genomed.db"` and calls
+`initialize_database()` at import time — there is no env var to redirect
+it. To avoid ever touching your real `genomed.db`, this suite:
+
+  1. Sets GENOMED_SECRET_KEY / GENOMED_ENCRYPTION_KEY *before* importing
+     `main` (those are read from the environment at import time).
+  2. chdir()s into a fresh temporary directory *before* importing `main`,
+     so the "genomed.db" created by the module-level
+     `initialize_database()` call lands harmlessly in that temp dir.
+  3. Monkeypatches `main.DATABASE_FILE = "test_genomed.db"` and calls
+     `main.initialize_database()` again so every subsequent `get_db()`
+     call (which re-reads the module global at call time) uses a
+     distinctly-named, empty test database inside that same temp dir.
+  4. On teardown, restores the original working directory and deletes
+     the whole temp directory (removing both "genomed.db" and
+     "test_genomed.db" — nothing written to disk survives the run).
+
+This requires ZERO changes to main.py.
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+import pytest
+from cryptography.fernet import Fernet
+
+# ---------------------------------------------------------------------------
+# 1. ENVIRONMENT + WORKING DIRECTORY SETUP — must happen before `import main`
+# ---------------------------------------------------------------------------
+
+_ORIGINAL_CWD = os.getcwd()
+_TEST_TMP_DIR = tempfile.mkdtemp(prefix="genomed_test_")
+
+# These are read via os.getenv(...) at module import time in main.py, so
+# they must be set before main is imported.
+os.environ["GENOMED_SECRET_KEY"] = "test-secret-key-do-not-use-in-prod"
+os.environ["GENOMED_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+
+os.chdir(_TEST_TMP_DIR)
+
+import main  # noqa: E402  (must be imported after env vars + chdir above)
+
+TEST_DB_FILE = "test_genomed.db"
+main.DATABASE_FILE = TEST_DB_FILE  # redirect all future get_db() calls
+main.initialize_database()  # create fresh tables in the isolated test db
+
+
+# ---------------------------------------------------------------------------
+# 2. FIXTURES
+# ---------------------------------------------------------------------------
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def client():
+    with TestClient(main.app) as c:
+        yield c
+
+
+def _unique_username(prefix="dr"):
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+@pytest.fixture(scope="session")
+def doctor_credentials():
+    return {
+        "username": _unique_username("ada"),
+        "password": "S3curePass!",
+        "name": "Dr. Ada Lovelace",
+        "specialization": "Genomic Medicine",
+    }
+
+
+@pytest.fixture(scope="session")
+def registered_doctor(client, doctor_credentials):
+    response = client.post("/doctor/register", json=doctor_credentials)
+    assert response.status_code == 201, (
+        f"Doctor registration failed: {response.status_code} {response.text}"
+    )
+    body = response.json()
+    assert body == {"message": "Doctor registered", "doctor": doctor_credentials["name"]}
+    return body
+
+
+@pytest.fixture(scope="session")
+def auth_token(client, doctor_credentials, registered_doctor):
+    response = client.post(
+        "/doctor/login",
+        json={
+            "username": doctor_credentials["username"],
+            "password": doctor_credentials["password"],
+        },
+    )
+    assert response.status_code == 200, f"Login failed: {response.status_code} {response.text}"
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert isinstance(body["access_token"], str) and body["access_token"].count(".") == 2
+    return body["access_token"]
+
+
+@pytest.fixture(scope="session")
+def auth_headers(auth_token):
+    return {"Authorization": f"Bearer {auth_token}"}
+
+
+@pytest.fixture(scope="session")
+def new_patient_payload():
+    return {
+        "id": f"pt_{uuid.uuid4().hex[:10]}",
+        "name": "John Doe",
+        "age": 41,
+        "gender": "male",
+        "phone": "+1-555-0100",
+        "diagnosis": "BRCA1 variant screening requested.",
+    }
+
+
+@pytest.fixture(scope="session")
+def created_patient(client, auth_headers, new_patient_payload):
+    response = client.post("/patient/add", json=new_patient_payload, headers=auth_headers)
+    assert response.status_code == 201, (
+        f"Patient creation failed: {response.status_code} {response.text}"
+    )
+    body = response.json()
+    assert body == {"message": "Patient added", "patient_id": new_patient_payload["id"]}
+    return new_patient_payload
+
+
+@pytest.fixture(scope="session")
+def new_appointment_payload(created_patient):
+    return {
+        "patient_id": created_patient["id"],
+        "date": "2026-08-15",
+        "time": "10:30",
+        "notes": "Genetic counseling follow-up",
+    }
+
+
+@pytest.fixture(scope="session")
+def booked_appointment_id(client, auth_headers, new_appointment_payload):
+    response = client.post("/appointment/book", json=new_appointment_payload, headers=auth_headers)
+    assert response.status_code == 201, (
+        f"Booking failed: {response.status_code} {response.text}"
+    )
+    assert response.json() == {"message": "Appointment booked"}
+
+    # /appointment/book does not return an id, so fetch it from the list.
+    listing = client.get("/appointments", headers=auth_headers)
+    assert listing.status_code == 200
+    matches = [
+        a for a in listing.json()["appointments"]
+        if a["patient_id"] == new_appointment_payload["patient_id"]
+        and a["date"] == new_appointment_payload["date"]
+        and a["time"] == new_appointment_payload["time"]
+    ]
+    assert matches, "Booked appointment not found in /appointments listing"
+    return matches[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# 3. TESTS
+# ---------------------------------------------------------------------------
+
+class TestHealthCheck:
+    def test_health_returns_expected_payload(self, client):
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "healthy",
+            "app": main.APP_NAME,
+            "version": main.VERSION,
+        }
+
+    def test_root_returns_app_metadata(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["application"] == main.APP_NAME
+        assert body["status"] == "Running"
+
+
+class TestDoctorRegistration:
+    def test_register_new_doctor_succeeds(self, client):
+        payload = {
+            "username": _unique_username("grace"),
+            "password": "AnotherSecure!",
+            "name": "Dr. Grace Hopper",
+            "specialization": "Clinical Genetics",
+        }
+        response = client.post("/doctor/register", json=payload)
+        assert response.status_code == 201
+        assert response.json() == {"message": "Doctor registered", "doctor": payload["name"]}
+
+    def test_register_duplicate_username_returns_409(self, client, doctor_credentials, registered_doctor):
+        response = client.post("/doctor/register", json=doctor_credentials)
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Username already exists"
+
+    def test_register_missing_fields_returns_422(self, client):
+        response = client.post("/doctor/register", json={"username": "incomplete"})
+        assert response.status_code == 422
+
+    def test_register_short_username_returns_422(self, client):
+        payload = {
+            "username": "ab",  # min_length=3
+            "password": "validpass",
+            "name": "Dr. Short",
+            "specialization": "Neurology",
+        }
+        response = client.post("/doctor/register", json=payload)
+        assert response.status_code == 422
+
+    def test_register_short_password_returns_422(self, client):
+        payload = {
+            "username": _unique_username("shortpw"),
+            "password": "abc",  # min_length=6
+            "name": "Dr. Short Pass",
+            "specialization": "Neurology",
+        }
+        response = client.post("/doctor/register", json=payload)
+        assert response.status_code == 422
+
+
+class TestDoctorLogin:
+    def test_login_with_valid_credentials_returns_token(self, client, doctor_credentials, registered_doctor):
+        response = client.post(
+            "/doctor/login",
+            json={
+                "username": doctor_credentials["username"],
+                "password": doctor_credentials["password"],
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["message"] == "Welcome " + doctor_credentials["name"]
+        assert body["token_type"] == "bearer"
+        assert body["access_token"].count(".") == 2
+
+    def test_login_with_wrong_password_returns_401(self, client, doctor_credentials, registered_doctor):
+        response = client.post(
+            "/doctor/login",
+            json={"username": doctor_credentials["username"], "password": "wrong-password"},
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Incorrect password"
+
+    def test_login_with_unknown_username_returns_404(self, client):
+        response = client.post(
+            "/doctor/login",
+            json={"username": "nobody_" + uuid.uuid4().hex[:6], "password": "whatever"},
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Doctor not found"
+
+
+class TestDoctorProfile:
+    def test_get_profile_with_valid_token_succeeds(self, client, auth_headers, doctor_credentials):
+        response = client.get("/doctor/profile", headers=auth_headers)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["username"] == doctor_credentials["username"]
+        assert body["name"] == doctor_credentials["name"]
+        assert body["specialization"] == doctor_credentials["specialization"]
+        assert "created_at" in body
+        assert "password" not in body
+
+    def test_get_profile_without_token_returns_403(self, client):
+        response = client.get("/doctor/profile")
+        assert response.status_code == 403
+
+    def test_get_profile_with_malformed_token_returns_401(self, client):
+        response = client.get(
+            "/doctor/profile", headers={"Authorization": "Bearer not-a-real-jwt"}
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Token expired"
+
+    def test_get_profile_with_wrong_secret_token_returns_401(self, client):
+        from jose import jwt as jose_jwt
+
+        bogus_token = jose_jwt.encode(
+            {"sub": "someone"}, "an-entirely-different-secret", algorithm=main.ALGORITHM
+        )
+        response = client.get(
+            "/doctor/profile", headers={"Authorization": f"Bearer {bogus_token}"}
+        )
+        assert response.status_code == 401
+
+
+class TestDoctorMyPatients:
+    def test_my_patients_includes_created_patient(self, client, auth_headers, created_patient):
+        response = client.get("/doctor/my-patients", headers=auth_headers)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] >= 1
+        ids = [p["id"] for p in body["patients"]]
+        assert created_patient["id"] in ids
+
+    def test_my_patients_without_token_returns_403(self, client):
+        response = client.get("/doctor/my-patients")
+        assert response.status_code == 403
+
+
+class TestPatientAdd:
+    def test_add_patient_succeeds(self, client, auth_headers):
+        payload = {
+            "id": f"pt_{uuid.uuid4().hex[:10]}",
+            "name": "Jane Roe",
+            "age": 33,
+            "gender": "female",
+            "phone": "+1-555-0111",
+            "diagnosis": "Routine carrier screening.",
+        }
+        response = client.post("/patient/add", json=payload, headers=auth_headers)
+        assert response.status_code == 201
+        assert response.json() == {"message": "Patient added", "patient_id": payload["id"]}
+
+    def test_add_patient_without_auth_returns_403(self, client):
+        payload = {"id": f"pt_{uuid.uuid4().hex[:10]}", "name": "No Auth", "age": 30}
+        response = client.post("/patient/add", json=payload)
+        assert response.status_code == 403
+
+    def test_add_patient_duplicate_id_returns_409(self, client, auth_headers, created_patient):
+        duplicate_payload = dict(created_patient)  # same "id" as the session fixture patient
+        response = client.post("/patient/add", json=duplicate_payload, headers=auth_headers)
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Patient ID exists"
+
+    def test_add_patient_invalid_age_returns_422(self, client, auth_headers):
+        payload = {"id": f"pt_{uuid.uuid4().hex[:10]}", "name": "Too Old", "age": 200}
+        response = client.post("/patient/add", json=payload, headers=auth_headers)
+        assert response.status_code == 422
+
+
+class TestPatientListAndGet:
+    def test_list_patients_includes_created_patient(self, client, auth_headers, created_patient):
+        response = client.get("/patients", headers=auth_headers)
+        assert response.status_code == 200
+        body = response.json()
+        assert isinstance(body["patients"], list)
+        ids = [p["id"] for p in body["patients"]]
+        assert created_patient["id"] in ids
+
+    def test_list_patients_without_auth_returns_403(self, client):
+        response = client.get("/patients")
+        assert response.status_code == 403
+
+    def test_get_patient_by_id_returns_decrypted_diagnosis(self, client, auth_headers, created_patient):
+        response = client.get(f"/patient/{created_patient['id']}", headers=auth_headers)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == created_patient["id"]
+        assert body["name"] == created_patient["name"]
+        assert body["diagnosis"] == created_patient["diagnosis"]
+        assert "medical_data_encrypted" not in body
+
+    def test_get_nonexistent_patient_returns_404(self, client, auth_headers):
+        response = client.get("/patient/does-not-exist", headers=auth_headers)
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Patient not found"
+
+    def test_get_patient_without_auth_returns_403(self, client, created_patient):
+        response = client.get(f"/patient/{created_patient['id']}")
+        assert response.status_code == 403
+
+
+class TestAppointments:
+    def test_book_appointment_succeeds(self, client, auth_headers, booked_appointment_id):
+        # booked_appointment_id fixture already asserts the booking succeeded
+        # and resolves the created appointment's id via GET /appointments.
+        assert isinstance(booked_appointment_id, int)
+
+    def test_book_appointment_without_auth_returns_403(self, client, new_appointment_payload):
+        response = client.post("/appointment/book", json=new_appointment_payload)
+        assert response.status_code == 403
+
+    def test_book_appointment_for_unknown_patient_returns_404(self, client, auth_headers):
+        response = client.post(
+            "/appointment/book",
+            json={"patient_id": "no-such-patient", "date": "2026-09-01", "time": "09:00"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Patient not found"
+
+    def test_list_appointments_includes_booked_appointment(self, client, auth_headers, booked_appointment_id):
+        response = client.get("/appointments", headers=auth_headers)
+        assert response.status_code == 200
+        body = response.json()
+        ids = [a["id"] for a in body["appointments"]]
+        assert booked_appointment_id in ids
+
+    def test_list_appointments_without_auth_returns_403(self, client):
+        response = client.get("/appointments")
+        assert response.status_code == 403
+
+    def test_update_appointment_status_succeeds(self, client, auth_headers, booked_appointment_id):
+        response = client.put(
+            f"/appointment/{booked_appointment_id}",
+            json={"status": "completed"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json() == {"message": "Appointment updated", "status": "completed"}
+
+    def test_update_appointment_invalid_status_returns_400(self, client, auth_headers, booked_appointment_id):
+        response = client.put(
+            f"/appointment/{booked_appointment_id}",
+            json={"status": "not-a-real-status"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid status"
+
+    def test_update_nonexistent_appointment_returns_404(self, client, auth_headers):
+        response = client.put(
+            "/appointment/999999", json={"status": "completed"}, headers=auth_headers
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Appointment not found"
+
+
+class TestDeletePatient:
+    def test_delete_patient_succeeds_then_404s_on_get(self, client, auth_headers, new_patient_payload):
+        disposable = dict(new_patient_payload)
+        disposable["id"] = f"pt_{uuid.uuid4().hex[:10]}"
+        create_response = client.post("/patient/add", json=disposable, headers=auth_headers)
+        assert create_response.status_code == 201
+
+        delete_response = client.delete(f"/patient/{disposable['id']}", headers=auth_headers)
+        assert delete_response.status_code == 200
+        assert delete_response.json() == {"message": "Patient deleted"}
+
+        get_response = client.get(f"/patient/{disposable['id']}", headers=auth_headers)
+        assert get_response.status_code == 404
+
+    def test_delete_patient_without_auth_returns_403(self, client, created_patient):
+        response = client.delete(f"/patient/{created_patient['id']}")
+        assert response.status_code == 403
+
+    def test_delete_nonexistent_patient_returns_404(self, client, auth_headers):
+        response = client.delete("/patient/does-not-exist", headers=auth_headers)
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Patient not found"
+
+
+class TestDataIsolationBetweenDoctors:
+    """Patients/appointments are scoped by doctor_id — verify one doctor
+    cannot see or modify another doctor's records."""
+
+    @pytest.fixture(scope="class")
+    def second_doctor_headers(self, client):
+        creds = {
+            "username": _unique_username("second"),
+            "password": "OtherSecure!",
+            "name": "Dr. Marie Curie",
+            "specialization": "Radiology",
+        }
+        reg = client.post("/doctor/register", json=creds)
+        assert reg.status_code == 201
+        login = client.post(
+            "/doctor/login", json={"username": creds["username"], "password": creds["password"]}
+        )
+        assert login.status_code == 200
+        token = login.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_other_doctor_cannot_see_patient(self, client, second_doctor_headers, created_patient):
+        response = client.get(f"/patient/{created_patient['id']}", headers=second_doctor_headers)
+        assert response.status_code == 404
+
+    def test_other_doctor_patients_list_excludes_patient(self, client, second_doctor_headers, created_patient):
+        response = client.get("/patients", headers=second_doctor_headers)
+        assert response.status_code == 200
+        ids = [p["id"] for p in response.json()["patients"]]
+        assert created_patient["id"] not in ids
+
+
+class TestHelpAndTutorialEndpoints:
+    def test_tutorial_returns_steps(self, client):
+        response = client.get("/tutorial")
+        assert response.status_code == 200
+        body = response.json()
+        assert "tutorial" in body and len(body["tutorial"]) > 0
+
+    def test_tutorial_again_returns_steps(self, client):
+        response = client.get("/tutorial/again")
+        assert response.status_code == 200
+        assert "tutorial" in response.json()
+
+    def test_help_center_returns_features(self, client):
+        response = client.get("/help")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["application"] == main.APP_NAME
+        assert isinstance(body["features"], list)
+
+    def test_faq_returns_entries(self, client):
+        response = client.get("/faq")
+        assert response.status_code == 200
+        body = response.json()
+        assert isinstance(body["faq"], list) and len(body["faq"]) > 0
+
+
+class TestUnauthorizedAccess:
+    """Cross-cutting checks across every protected route."""
+
+    PROTECTED_GET_ROUTES = [
+        "/doctor/profile",
+        "/doctor/my-patients",
+        "/patients",
+        "/appointments",
+    ]
+
+    @pytest.mark.parametrize("url", PROTECTED_GET_ROUTES)
+    def test_missing_token_returns_403(self, client, url):
+        response = client.get(url)
+        assert response.status_code == 403
+
+    @pytest.mark.parametrize("url", PROTECTED_GET_ROUTES)
+    def test_malformed_token_returns_401(self, client, url):
+        response = client.get(url, headers={"Authorization": "Bearer garbage.token.value"})
+        assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 4. SESSION CLEANUP
+# ---------------------------------------------------------------------------
+
+def teardown_module(module):
+    """Restore the original working directory and remove the entire temp
+    directory (both the incidental 'genomed.db' and 'test_genomed.db')."""
+    os.chdir(_ORIGINAL_CWD)
+    shutil.rmtree(_TEST_TMP_DIR, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
